@@ -58,13 +58,37 @@ pdf2md scan.pdf --ocr force    # OCR every page
 ```
 
 - The first OCR run downloads the PP-OCRv6 Small models (~31 MB) into the platform cache dir.
-  Set `PDF_INSPECTOR_MODEL_CACHE` to change where they go, or use `--ocr-model-dir DIR --ocr-offline`
-  for air-gapped hosts.
+  Set `PDF_INSPECTOR_MODEL_CACHE` to change where they go. For hosts without internet access,
+  see [Offline OCR models](#offline-ocr-models).
 - Linux OCR builds need glibc. ONNX Runtime doesn't ship musl builds.
 - No OCR builds exist for Intel macOS or Windows ARM64, because upstream PDFium/ONNX Runtime
   don't publish matching binaries for them.
 - macOS: if you download with a browser, clear the quarantine flag first or the unsigned
   binaries and dylibs won't load: `xattr -dr com.apple.quarantine pdf-inspector-*-ocr/`.
+
+### Offline OCR models
+
+Each release includes `pdf-inspector-ocr-models-<id>-<revision>.tar.gz`, a mirror of the exact model
+set that release's `pdf2md` pins. CI checks every file against those pinned SHA-256 hashes, and `pdf2md`
+checks them again each time it loads them. The archive uses the model cache layout,
+`<id>/<revision>/<files>`, plus the models' Apache-2.0 license. There are two ways to use it:
+
+```bash
+# 1. Extract into a model cache root
+tar xzf pdf-inspector-ocr-models-*.tar.gz -C /opt/pdf-inspector-models
+export PDF_INSPECTOR_MODEL_CACHE=/opt/pdf-inspector-models
+pdf2md scan.pdf --ocr auto --ocr-offline
+
+# 2. Point directly at the model directory
+pdf2md scan.pdf --ocr auto --ocr-offline \
+  --ocr-model-dir /opt/pdf-inspector-models/pp-ocrv6-small/oar-ocr-v0.7.0
+```
+
+If you extract into the default cache root instead, you need neither the variable nor the flag.
+The default root is `~/.cache/pdf-inspector/models` on Linux,
+`~/Library/Caches/pdf-inspector/models` on macOS, and `%LOCALAPPDATA%\pdf-inspector\models` on Windows.
+`--ocr-offline` makes a missing or corrupt model an error instead of a download attempt.
+Windows 10+ ships `tar`, so the same command works there.
 
 Upstream pins these runtime versions in `docs/ocr-runtime.md`. If a future upstream release
 changes them, update the URLs and SHA-256 hashes in the `build` matrix of `release.yml`.

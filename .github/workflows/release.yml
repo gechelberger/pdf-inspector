@@ -144,6 +144,7 @@ jobs:
             zig-target: x86_64-unknown-linux-gnu.2.17
             smoke: true
             ocr: true
+            models: true
             pdfium: firecrawl-pdfium-linux-x64.tgz
             pdfium-sha256: 6248189e07bbc33cdeb31976c539a88614307c8a19f3276dbd018efbe5b4a2a2
             ort: onnxruntime-linux-x64-1.27.0.tgz
@@ -295,6 +296,47 @@ jobs:
           print(page["markdown"][:500])
           PY
 
+      # Mirrors the pinned OCR model set for offline hosts. The OCR smoke test
+      # above downloaded it and verified each file against the SHA-256s pinned
+      # in upstream's src/vision/models.rs, so the binary is the source of truth.
+      # The archive keeps the cache layout (<id>/<revision>/<files>) so it can
+      # be extracted straight into a model cache root.
+      - name: Package OCR models
+        if: matrix.models
+        shell: bash
+        run: |
+          cache="$RUNNER_TEMP/models"
+          mapfile -t sets < <(find "$cache" -mindepth 2 -maxdepth 2 -type d)
+          if [ "${#sets[@]}" -ne 1 ]; then
+            echo "expected exactly one model set in $cache, found: ${sets[*]}"
+            exit 1
+          fi
+          revision=$(basename "${sets[0]}")
+          id=$(basename "$(dirname "${sets[0]}")")
+          name="pdf-inspector-ocr-models-$id-$revision"
+
+          stage="$RUNNER_TEMP/models-stage"
+          mkdir -p "$stage/$id/$revision"
+          # Skip the downloader's dot-prefixed lock files.
+          find "${sets[0]}" -maxdepth 1 -type f ! -name '.*' -exec cp {} "$stage/$id/$revision/" \;
+          # oar-ocr (Apache-2.0) publishes the converted PaddleOCR models;
+          # revision "oar-ocr-vX" is its release tag vX.
+          curl --fail --location --silent --show-error \
+            "https://raw.githubusercontent.com/GreatV/oar-ocr/${revision#oar-ocr-}/LICENSE" \
+            --output "$stage/$id/$revision/LICENSE-oar-ocr.txt"
+          ls -la "$stage/$id/$revision"
+          tar czf "dist/$name.tar.gz" -C "$stage" "$id"
+
+          # Prove both documented offline layouts work from the archive alone.
+          check="$RUNNER_TEMP/models-check"
+          mkdir -p "$check"
+          tar xzf "dist/$name.tar.gz" -C "$check"
+          PDF_INSPECTOR_MODEL_CACHE="$check" "dist/$NAME/pdf2md" \
+            tests/fixtures/scan_with_native_header_text.pdf --ocr force --ocr-offline --json > /dev/null
+          PDF_INSPECTOR_MODEL_CACHE="$RUNNER_TEMP/empty-cache" "dist/$NAME/pdf2md" \
+            tests/fixtures/scan_with_native_header_text.pdf --ocr force --ocr-offline \
+            --ocr-model-dir "$check/$id/$revision" --json > /dev/null
+
       - name: Archive
         shell: bash
         run: |
@@ -341,7 +383,7 @@ jobs:
           else
             notes="Prebuilt \`pdf2md\` and \`detect-pdf\` CLIs built from [\`${SHA:0:12}\`](https://github.com/$GITHUB_REPOSITORY/commit/$SHA).
 
-          Assets ending in \`-ocr\` are built with \`--features ocr\` and bundle PDFium and ONNX Runtime next to the binaries; OCR models (~31 MB) download on first use. All other assets are text extraction only.
+          Assets ending in \`-ocr\` are built with \`--features ocr\` and bundle PDFium and ONNX Runtime next to the binaries; OCR models (~31 MB) download on first use. For offline hosts, \`pdf-inspector-ocr-models-*.tar.gz\` mirrors the pinned model set (see the fork README). All other assets are text extraction only.
 
           Upstream changelog: https://github.com/$UPSTREAM/blob/$SHA/CHANGELOG.md"
             # --target only applies when the tag does not exist yet (tags
