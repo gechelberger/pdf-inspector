@@ -1,0 +1,345 @@
+# Builds the pdf2md and detect-pdf CLIs from `main` and publishes them as a
+# GitHub release tagged v<Cargo.toml version>.
+#
+# This file lives on the fork's `release` branch (the default branch) so that
+# `main` stays a pristine mirror of firecrawl/pdf-inspector and syncs never
+# conflict. Every job checks out `main` (or the `ref` input) for the source.
+name: Release CLI
+
+on:
+  schedule:
+    - cron: "17 6 * * *" # daily: pick up new upstream versions
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to build
+        default: main
+      force:
+        description: Rebuild and overwrite assets even if the release already exists
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-cli
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  UPSTREAM: firecrawl/pdf-inspector
+
+jobs:
+  resolve:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.version.outputs.sha }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      build: ${{ steps.version.outputs.build }}
+    steps:
+      # Optional: fast-forward main from upstream first. Needs a PAT with
+      # Contents + Workflows write on this repo (GITHUB_TOKEN cannot push
+      # changes under .github/workflows, which upstream edits regularly).
+      - name: Sync main from upstream
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          REF: ${{ inputs.ref || 'main' }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "SYNC_TOKEN not set; skipping upstream sync"
+            exit 0
+          fi
+          if [ "$REF" != "main" ]; then
+            echo "building $REF; skipping upstream sync"
+            exit 0
+          fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch=main
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+
+      - name: Read version and check for an existing release
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          tag="v$version"
+          sha=$(git rev-parse HEAD)
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "sha=$sha"
+          } >> "$GITHUB_OUTPUT"
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "$FORCE" != "true" ]; then
+            echo "Release $tag already exists; nothing to do (use force to rebuild)"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Building $tag from $sha"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    name: Test
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      # rustup installs the toolchain pinned by upstream's rust-toolchain.toml.
+      - name: Run tests
+        run: cargo test
+
+  build:
+    name: Build ${{ matrix.target }}${{ matrix.ocr && ' (OCR)' || '' }}
+    needs: [resolve, test]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds go through cargo-zigbuild: gnu targets link against
+          # glibc 2.17 so they run on old distros; musl targets are fully static.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            zig-target: x86_64-unknown-linux-gnu.2.17
+            smoke: true
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            zig-target: aarch64-unknown-linux-gnu.2.17
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            zig-target: x86_64-unknown-linux-musl
+            smoke: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            zig-target: aarch64-unknown-linux-musl
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            smoke: true
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            smoke: true
+          - target: aarch64-pc-windows-msvc
+            runner: windows-latest
+
+          # OCR variants bundle PDFium and ONNX Runtime next to the binaries,
+          # where both loaders look by default. Only the platforms upstream
+          # documents in docs/ocr-runtime.md have both runtimes published.
+          # Each runs on a native runner so the OCR smoke test can execute.
+          # Hashes: PDFium's release SHA256SUMS and GitHub's ORT asset digests.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            zig-target: x86_64-unknown-linux-gnu.2.17
+            smoke: true
+            ocr: true
+            pdfium: firecrawl-pdfium-linux-x64.tgz
+            pdfium-sha256: 6248189e07bbc33cdeb31976c539a88614307c8a19f3276dbd018efbe5b4a2a2
+            ort: onnxruntime-linux-x64-1.27.0.tgz
+            ort-sha256: 547e40a48f1fe73e3f812d7c88a948612c23f896b91e4e2ee1e232d7b468246f
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            zig-target: aarch64-unknown-linux-gnu.2.17
+            smoke: true
+            ocr: true
+            pdfium: firecrawl-pdfium-linux-arm64.tgz
+            pdfium-sha256: fb67e132abf9a816194bb40cbe1c9e1f6e3bfcaa0b0ef645bf2e6b9f155c8a73
+            ort: onnxruntime-linux-aarch64-1.27.0.tgz
+            ort-sha256: 3e4d83ac06924a32a07b6d7f91ce6f852876153fc0bbdf931bf517a140bfbe48
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            smoke: true
+            ocr: true
+            pdfium: firecrawl-pdfium-mac-arm64.tgz
+            pdfium-sha256: 4168356c2e62ad5e79553e2e9162f5c99949759d90cb83876a50311f0c32b9b3
+            ort: onnxruntime-osx-arm64-1.27.0.tgz
+            ort-sha256: 545e81c58152353acb0d1e8bd6ce4b62f830c0961f5b3acfedc790ffd76e477a
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            smoke: true
+            ocr: true
+            pdfium: firecrawl-pdfium-win-x64.tgz
+            pdfium-sha256: 6f398552d8021a89078f64466557251a204999177287b876be49877eb8750d50
+            ort: onnxruntime-win-x64-1.27.0.zip
+            ort-sha256: c5c81710938e68079ff1a192b04897faabe4b43830d48f39f27ecd4e16138bfc
+    env:
+      NAME: pdf-inspector-${{ needs.resolve.outputs.tag }}-${{ matrix.target }}${{ matrix.ocr && '-ocr' || '' }}
+      BIN: target/${{ matrix.target }}/release
+      EXE: ${{ contains(matrix.target, 'windows') && '.exe' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - name: Add Rust target
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install zig
+        if: matrix.zig-target
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.1
+
+      - name: Install cargo-zigbuild
+        if: matrix.zig-target
+        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build
+        shell: bash
+        run: |
+          args=(--release --bin pdf2md --bin detect-pdf)
+          if [ "${{ matrix.ocr }}" = "true" ]; then
+            args+=(--features ocr)
+          fi
+          if [ -n "${{ matrix.zig-target }}" ]; then
+            cargo zigbuild "${args[@]}" --target ${{ matrix.zig-target }}
+          else
+            cargo build "${args[@]}" --target ${{ matrix.target }}
+          fi
+
+      - name: Stage package
+        shell: bash
+        run: |
+          mkdir -p "dist/$NAME"
+          cp LICENSE README.md "$BIN/pdf2md$EXE" "$BIN/detect-pdf$EXE" "dist/$NAME/"
+
+      - name: Bundle OCR runtime
+        if: matrix.ocr
+        shell: bash
+        run: |
+          dest="$PWD/dist/$NAME"
+          work="$RUNNER_TEMP/ocr-runtime"
+          mkdir -p "$work" && cd "$work"
+          curl --fail --location --silent --show-error -O \
+            "https://github.com/firecrawl/pdfium-rs/releases/download/native-v7988/${{ matrix.pdfium }}"
+          curl --fail --location --silent --show-error -O \
+            "https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/${{ matrix.ort }}"
+          printf '%s  %s\n' \
+            "${{ matrix.pdfium-sha256 }}" "${{ matrix.pdfium }}" \
+            "${{ matrix.ort-sha256 }}" "${{ matrix.ort }}" | shasum -a 256 -c
+
+          mkdir pdfium ort
+          tar -xzf "${{ matrix.pdfium }}" -C pdfium
+          case "${{ matrix.ort }}" in
+            *.zip) 7z x -oort "${{ matrix.ort }}" >/dev/null ;;
+            *) tar -xzf "${{ matrix.ort }}" -C ort ;;
+          esac
+          ort_lib=$(find ort -type d -name lib -print -quit)
+
+          # File names must match what firecrawl-pdfium and ort look for
+          # next to the executable. -L copies the real file behind symlinks.
+          case "${{ matrix.target }}" in
+            *linux*)
+              cp -L pdfium/lib/libpdfium.so "$ort_lib/libonnxruntime.so" "$dest/" ;;
+            *apple*)
+              cp -L pdfium/lib/libpdfium.dylib "$ort_lib/libonnxruntime.dylib" "$dest/" ;;
+            *windows*)
+              cp pdfium/bin/pdfium.dll "$ort_lib/onnxruntime.dll" \
+                "$ort_lib/onnxruntime_providers_shared.dll" "$dest/" ;;
+          esac
+
+          mkdir -p "$dest/licenses/pdfium" "$dest/licenses/onnxruntime"
+          cp pdfium/LICENSE pdfium/licenses/* "$dest/licenses/pdfium/"
+          cp "$(dirname "$ort_lib")"/{LICENSE,ThirdPartyNotices.txt} "$dest/licenses/onnxruntime/"
+          ls -la "$dest"
+
+      - name: Smoke test
+        if: matrix.smoke
+        shell: bash
+        run: |
+          "dist/$NAME/detect-pdf$EXE" tests/fixtures/accessory_building_permit_prose_frame.pdf
+          "dist/$NAME/pdf2md$EXE" --raw tests/fixtures/accessory_building_permit_prose_frame.pdf > smoke.md
+          wc -c smoke.md
+          test -s smoke.md
+
+      # Runs the packaged binary with no PDFIUM_LIB_PATH / ORT_DYLIB_PATH, so
+      # it proves the bundled libraries are found next to the executable.
+      # The first OCR run downloads the ~31 MB model set.
+      - name: OCR smoke test
+        if: matrix.ocr
+        shell: bash
+        run: |
+          export PDF_INSPECTOR_MODEL_CACHE="$RUNNER_TEMP/models"
+          "dist/$NAME/pdf2md$EXE" tests/fixtures/scan_with_native_header_text.pdf \
+            --ocr auto --json > ocr.json
+          py=$(command -v python3 || command -v python)
+          "$py" - <<'PY'
+          import json
+          result = json.load(open("ocr.json", encoding="utf-8"))
+          assert result["pages_routed_to_ocr"], result["pages_routed_to_ocr"]
+          page = result["pages"][0]
+          assert page["source"] in {"ocr", "fused"}, page["source"]
+          assert page["markdown"].strip()
+          print(page["markdown"][:500])
+          PY
+
+      - name: Archive
+        shell: bash
+        run: |
+          cd dist
+          if [ -n "$EXE" ]; then
+            7z a -tzip "$NAME.zip" "$NAME" >/dev/null
+          else
+            tar czf "$NAME.tar.gz" "$NAME"
+          fi
+          rm -rf "$NAME"
+          ls -la
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cli-${{ matrix.target }}${{ matrix.ocr && '-ocr' || '' }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: cli-*
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber ./*
+          else
+            notes="Prebuilt \`pdf2md\` and \`detect-pdf\` CLIs built from [\`${SHA:0:12}\`](https://github.com/$GITHUB_REPOSITORY/commit/$SHA).
+
+          Assets ending in \`-ocr\` are built with \`--features ocr\` and bundle PDFium and ONNX Runtime next to the binaries; OCR models (~31 MB) download on first use. All other assets are text extraction only.
+
+          Upstream changelog: https://github.com/$UPSTREAM/blob/$SHA/CHANGELOG.md"
+            # --target only applies when the tag does not exist yet (tags
+            # copied from upstream at fork time are reused as-is).
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --target "$SHA" --title "$TAG" --notes "$notes" --latest ./*
+          fi
